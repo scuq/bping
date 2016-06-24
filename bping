@@ -1,0 +1,265 @@
+#!/bin/bash
+# Copyright (C) 2016    sn (at) kages.at (aka-I-dont-like-bash)
+#
+# bping 
+# bping - bash ping
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+#
+# http://www.gnu.org/licenses/gpl.txt
+
+VERSION="16.6.24-1"
+
+
+
+function display_usage() { 
+	echo -e "\nSetup:\n$0 You need a bping config file, /etc/bping.conf\n" 
+	echo "Example-Config:" 
+	echo
+	echo "#will be sourced by bash, respect that!"
+	echo "TARGETLIST="10.1.1.101 10.1.1.102""
+	echo "PIDSFILE="/tmp/bping.pids""
+	echo "LOGDIR="/tmp/bping""
+	echo "#POSTROTATECOMMAND="timeout 20 scp %rotatedlog% user@10.1.1.1:/var/log/bping/%srcip%_%dstip%_%date%.log""
+	echo
+	echo -e "\nUsage:\n$0 [ping | start] \n" 
+	} 
+
+function valid_ip()
+{
+    local  ip=$1
+    local  stat=1
+
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        OIFS=$IFS
+        IFS='.'
+        ip=($ip)
+        IFS=$OIFS
+        [[ ${ip[0]} -le 255 && ${ip[1]} -le 255 \
+            && ${ip[2]} -le 255 && ${ip[3]} -le 255 ]]
+        stat=$?
+    fi
+    return $stat
+}
+
+function isNumber {
+
+    local testNo=$1
+    local varIsNumber=0
+
+    regExp='^[+-]?([0-9]+\.?|[0-9]*\.[0-9]+)$'
+    if [[ $testNo =~ $regExp ]]
+    then
+        varIsNumber=1
+    else
+        varIsNumber=0
+    fi
+    return $varIsNumber
+}
+
+function getSrcIp {
+
+	local targetIp=$1
+	local srcIp=0
+
+	srcIp="$(ip -o route get ${targetIp} | grep -o "src [0-9]*\.[0-9]*\.[0-9]*\.[0-9]*" | sed s'/src //g')"
+
+	valid_ip $srcIp
+	if [[ $? -ne  0 ]]; then
+		srcIp="127.0.0.1"
+	fi
+	echo $srcIp
+
+}
+
+## decide mode
+
+MODE="$1"
+ROTATE=0
+
+if [ "$MODE" == "ping" ]; then
+
+	TARGET="$2"
+	
+	STARTDAY="$(date +%Y%m%d)"
+	PACKETSIZE=1000
+
+	echo "ping mode started for $TARGET"
+	while true
+	do
+		CURRENTDAY="$(date +%Y%m%d)"
+
+		# restart to rotate logs
+		if [ "$STARTDAY" != "$CURRENTDAY" ]; then
+			$0 start rotate & 
+		fi
+		
+		srcIP=$(getSrcIp $TARGET)
+		
+		timestamp="$(date +%Y-%m-%d_%H:%M:%S)"
+
+		output="$(ping -c 1 -s ${PACKETSIZE} $TARGET -w 1 2>&1)"
+		if [[ $? -eq  0 ]]; then
+			echo -n "$timestamp OK"
+		else
+			echo -n "$timestamp NOT-OK"
+		fi	
+
+		echo -n " ${srcIP}->${TARGET}"
+
+		rtt="$(echo $output | grep -o "time=[0-9]*\.[0-9]*" | sed 's/time=//g')"
+		truncated="$(echo $output | grep "truncated" | wc -l)"
+
+		if [[ truncated -ge  1 ]]; then
+			echo "Packetsize of $PACKETSIZE truncated, switching to 56"
+			PACKETSIZE=56
+		fi
+		
+
+
+		isNumber $rtt
+
+
+		if [[ $? -eq  1 ]]; then
+			echo " $rtt"
+		else
+			echo " -10"
+		fi
+		
+		sleep 2
+		
+	done
+
+	exit 0
+
+else
+
+	if [ "$MODE" == "start" ]; then
+		echo "starting."
+		if [ "$2" == "rotate" ]; then
+			ROTATE=1
+		fi
+
+	else 
+		if [ "$MODE" == "" ]; then
+			display_usage
+			exit 1
+		fi
+	fi
+
+fi
+
+
+
+###
+
+## read conf
+
+CONFFILE="/etc/bping.conf"
+
+if [ ! -f $CONFFILE ] ; then
+        echo ERROR: Config file $CONFFILE does not exist!
+        exit 1
+fi
+
+echo -e "Using config file $CONFFILE ...\n" 
+source $CONFFILE
+
+if [ "$TARGETLIST" == "" ] ; then
+        echo ERROR: TARGETLIST not set in $CONFFILE
+        exit 1
+fi
+
+if [ "$PIDSFILE" == "" ] ; then
+	PIDSFILE="/tmp/bping.pids"
+        echo PIDSFILE not set in $CONFFILE using $PIDSFILE
+fi
+
+if [ "$LOGDIR" == "" ] ; then
+        LOGDIR="/tmp/bping"
+        echo LOGDIR not set in $CONFFILE using $LOGDIR
+fi
+
+
+if [ "$POSTROTATECOMMAND" == "" ] ; then
+        POSTROTATECOMMAND=""
+        echo POSTROTATECOMMAND not set in $CONFFILE disabling.
+fi
+
+
+
+if [ ! -d $LOGDIR ] ; then
+	mkdir -p $LOGDIR
+	if [ ! -d $LOGDIR ] ; then
+		echo "LOGDIR $LOGDIR doesn't exist and couldn't be created."
+		exit 1
+	else
+		echo "LOGDIR $LOGDIR created."
+	fi
+	
+fi
+
+
+if [ -f $PIDSFILE ] ; then
+
+	echo "killing running bpings:"
+	for oldpid in `cat ${PIDSFILE}`; do
+		echo "PID $oldpid"
+		kill $oldpid 2>/dev/null
+		kill -9 $oldpid 2>/dev/null
+	done
+	rm ${PIDSFILE}
+
+fi
+
+##
+
+CHECKED_TARGETLIST=()
+
+for ip in ${TARGETLIST}; do
+
+	valid_ip $ip
+	if [[ $? -eq  0 ]]; then
+		echo -e "$ip is an valid ipv4-address."
+		CHECKED_TARGETLIST+=($ip)
+	else
+		echo -e "$ip is an invalid ipv4-address."
+	fi
+done
+
+STARTDAY="$(date +%Y%m%d)"
+YESTERDAY=`date -d @$(( $(date +"%s") - 86400)) +"%Y%m%d"`
+
+for ip in ${CHECKED_TARGETLIST[@]}; do
+
+	if [ $ROTATE -eq 1 ] ; then
+		if [ "$POSTROTATECOMMAND" != "" ] ; then
+			if [ -f ${LOGDIR}/${ip}_${YESTERDAY}.log ] ; then
+				echo "rotating."
+				srcIP=$(getSrcIp $ip)
+				POSTROTATECOMMAND="${POSTROTATECOMMAND/\%rotatedlog\%/${LOGDIR}\/${ip}_${YESTERDAY}.log}"
+				POSTROTATECOMMAND="${POSTROTATECOMMAND/\%srcip\%/${srcIP}}"
+				POSTROTATECOMMAND="${POSTROTATECOMMAND/\%dstip\%/${ip}}"
+				POSTROTATECOMMAND="${POSTROTATECOMMAND/\%date\%/${YESTERDAY}}"
+				$POSTROTATECOMMAND &
+			fi
+		fi
+	fi
+
+	$0 ping $ip </dev/null &>>${LOGDIR}/${ip}_${STARTDAY}.log & 
+	echo $! >> ${PIDSFILE}
+
+done
+
